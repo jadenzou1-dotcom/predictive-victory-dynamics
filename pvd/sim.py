@@ -1,0 +1,449 @@
+"""Monte Carlo battle model for Genshin's "Predictive Victory Dynamics" event.
+
+v3 (after the R16-A replay):
+  * fixed 45 s battle clock; no HP drain was observed inside it (see docs/JOURNAL.md)
+  * elemental auras and reactions (freeze, vaporize/melt, electro-charged,
+    superconduct, swirl); Freeze stuns the target
+  * dual-element units (e.g. "Hydro|Cryo") alternate elements and so can
+    freeze on their own; kiting ranged units retreat from melee
+  * parameters seen in a replay are drawn from data/processed/calibration_samples.csv
+    (approximate-Bayesian posterior, see calibrate.py); unseen units and
+    unseen mechanics are drawn from the prior.
+
+Usage: python -m pvd sim <round> [runs] [--prior]
+"""
+import csv, math, random, sys
+from pvd import RAW, PROCESSED, RESULTS, REPLAYS
+
+BEATS = {("Ranged", "Flying"), ("Flying", "Melee"), ("Melee", "Ranged"),
+         ("AoE", "Squad"), ("Squad", "Single-Target"), ("Single-Target", "AoE")}
+WRONG_PICK_POINTS = 10
+CLOCK = 45.0
+OVERTIME = 60.0   # after the clock: overtime pulses (see run) until one side is wiped
+OT_DELAY = 1.5    # QF-A M1 and QF-B M1: the overtime hit lands ~1.5 s after the clock reads 00:00
+AURA_S = 6.0
+
+GLOBAL_KEYS = ("g", "k", "per_member", "freeze_s", "amp", "rain_on", "shatter", "cryo_slow", "aoe_r", "ot_pct", "ot_period", "boss_freeze", "plunge_x", "target_mode",
+               "mist_t0", "mist_iv", "mist_r", "mist_dur", "mist_tick")
+SHRINK_N0 = 2.0   # per-unit posterior weight = n / (n + SHRINK_N0), n = replays the unit appeared in
+BATTLE_NOISE = 0.15   # per-battle lognormal damage noise per unit (crits, AI targeting luck)
+UNIT_KEYS = ("dmg", "iv")
+
+
+# ---------------------------------------------------------------- priors
+# Damage per 100% hit / card ATK = DEF factor x RES factor. All units are level 80, so
+# DEF factor = (80+100)/((80+100)+(80+100)) = 0.5; standard enemy RES 10% -> 0.9. Product 0.45.
+# Measured from replay damage numbers: 7 units hit at 0.449x ATK (Electro Cicin, Hydro Fungus,
+# Ladler, Electro Shooter, Electro Specter, Galehunter, Seahorse); other hits sit on a skill
+# ladder at 0.5x / 1.5x / 2x of that (0.225, 0.674, 0.908).
+DEF_FACTOR, RES_FACTOR = 0.5, 0.9
+HIT_G = DEF_FACTOR * RES_FACTOR
+FLAT_RX = 800.0    # transformative reactions (Overloaded, Electro-Charged, Superconduct) deal a flat
+                   # amount: 400/800 recur dozens of times regardless of attacker ATK (R16-C)
+
+
+def prior_global():
+    return dict(g=HIT_G,                             # fixed by measurement (was a free parameter)
+                k=random.uniform(1.0, 1.15),         # counter multiplier per triangle on DAMAGE. Replay damage numbers
+                                                     # show 1.0x on advantaged and disadvantaged matchups alike (two
+                                                     # independent frame checks, R16-A/B/C), so near 1; small slack
+                                                     # left in case counters act through something not yet seen
+                per_member=1.0,                      # FIXED 2026-10-18: damage-number totals vs HP-bar loss in R16-B (Fruity)
+                                                     # and R16-C (Chubby) fit full card HP per squad member (0.43/0.36 vs
+                                                     # 0.35-0.43 capture on single-unit teams); shared HP gives 0.82/0.95
+                freeze_s=random.uniform(0.5, 6.0),   # stun per Freeze (R16-A: Sappho kept the Lawachurl frozen 10 s straight)
+                amp=random.uniform(1.2, 2.0),        # vaporize/melt multiplier
+                rain_on=float(random.random() < 0.5),  # Hydro rain wets own team
+                shatter=random.uniform(0.0, 1.0),    # bonus vs frozen targets
+                cryo_slow=(0.0 if random.random() < 0.5 else random.uniform(0.0, 0.5)),
+                aoe_r=random.uniform(0.4, 1.6),       # AoE radius in grid cells (learned from R16-A AoE-vs-squad fights)
+                # Overtime (2026-10-18, measured): QF-A M1 and QF-B M1 both show ONE step drop of the winner's
+                # team bar 1.5 s after 00:00 (Sappho 0.608 -> 0.507 = 10.1% max HP; Grenadier 0.526 -> 0.407 =
+                # 11.9%), then flat for 2.5 s; the loser's sliver dies to it. Continuous drain is ruled out.
+                ot_pct=random.uniform(0.09, 0.13),        # fraction of max HP every unit loses per overtime pulse
+                ot_period=random.uniform(4.5, 12.0),      # seconds between pulses: SF M2 shows no 2nd pulse within 4.4 s of the first
+                target_mode=float(random.choice((0, 1, 2))),  # 0 nearest foe, 1 lowest current HP, 2 sticky random
+                # Sappho frost field (SF M1 frames 00:35-00:32): a large field on the enemy cluster; opening hit
+                # 5461 = 0.281 ATK (Hydro) on everyone inside, then repeated 1092 = 0.0563 ATK Cryo ticks.
+                # Damage per hit is measured; timing, radius and duration are fitted.
+                mist_t0=random.uniform(4.0, 16.0),    # first cast (s)
+                mist_iv=random.uniform(12.0, 30.0),   # recast period (s)
+                mist_r=random.uniform(1.2, 3.0),      # radius in grid cells
+                mist_dur=random.uniform(2.0, 5.0),    # field lifetime (s)
+                mist_tick=random.uniform(0.3, 1.0),   # seconds between Cryo ticks
+                plunge_x=random.uniform(0.9, 1.3),   # Ninken post-kill plunge: QF-B frames 69.9-70.3 show it lands as 4854 on
+                                                     # several slimes = exactly the normal hit (0.449 ATK), AoE; so ~1x
+                boss_freeze=float(random.random() < 0.25))  # can Boss-tagged units be frozen? R16-A frame sweep: Sappho had
+                                                             # 2 Hydro+Cryo chances, 0 freezes (Lawachurl froze 4x in the same
+                                                             # fight). Weak evidence -> P(freezable) = 0.25, not 0  # 1 = flat, 0 = percentage (replay can't yet tell them apart)  # overtime: flat HP/s lost by EVERY unit after the clock (user hypothesis)  # attack-interval increase while Cryo-afflicted (hypothesis)
+
+_MEAS = None
+
+
+def measured_hits():
+    """Per-hit damage measured from replay damage numbers: unit_id -> damage / card ATK."""
+    global _MEAS
+    if _MEAS is None:
+        p = PROCESSED / "unit_hits_measured.csv"
+        _MEAS = {r["unit_id"]: float(r["hit_ratio"]) for r in csv.DictReader(open(p))} if p.exists() else {}
+    return _MEAS
+
+
+def prior_unit(uid=None):
+    # a 100% hit is HIT_G x ATK; skill multipliers seen in replays run 50%-200%, so the average
+    # multiplier per attack is centred at 1.0 with that spread. Attack interval carries speed
+    # and is learned from the HP curves.
+    m = measured_hits().get(uid)
+    if m:   # damage per hit read off the replay: centre dmg there, keep 20% slack (hit mix, crits)
+        return dict(dmg=random.lognormvariate(math.log(m / HIT_G), 0.2), iv=random.uniform(1.0, 6.0))
+    return dict(dmg=random.lognormvariate(0.0, 0.45), iv=random.uniform(1.0, 6.0))
+
+
+def load_posterior():
+    p = PROCESSED / "calibration_samples.csv"
+    return list(csv.DictReader(open(p))) if p.exists() else []
+
+
+def replay_counts():
+    """How many observed replays each unit type has appeared in."""
+    import glob as _g
+    obs = []
+    for f in sorted(_g.glob(str(REPLAYS / "*_outcomes.csv"))):
+        obs += list(csv.DictReader(open(f)))
+    places = list(csv.DictReader(open(RAW / "placements.csv")))
+    n = {}
+    for o in obs:
+        for u in {p["unit_id"] for p in places if p["round"] == o["round"] and p["match"] == o["match"]}:
+            n[u] = n.get(u, 0) + 1
+    return n
+
+
+def draw_params(unit_ids, posterior, counts=None):
+    """One joint draw. Global parameters come from a weighted posterior row (shared by
+    every match, so best identified). Per-unit parameters are shrunk toward the prior:
+    a unit seen in n replays uses its posterior value with probability n/(n+SHRINK_N0)
+    and a fresh prior draw otherwise, so one battle can't make a unit look certain."""
+    if not posterior:
+        return prior_global(), {u: prior_unit(u) for u in unit_ids}
+    counts = counts or {}
+    row = random.choices(posterior, weights=[float(r.get("weight", 1)) for r in posterior])[0]
+    glob = {k: float(row[k]) for k in GLOBAL_KEYS if k in row}
+    for k, v in prior_global().items():
+        glob.setdefault(k, v)
+    glob["g"] = HIT_G   # measured; never taken from an older posterior row
+    glob["per_member"] = 1.0   # measured (see prior_global); older rows with 0 are overridden
+    # boss_freeze is kept from the row: rows are fit under the 0.25 prior, so the row's own value
+    # stays consistent with the Sappho parameters fitted alongside it (panel agent 3)
+    # Shrinkage is drawn once per SOURCE REPLAY GROUP, not per unit: units fitted jointly in the
+    # same replays (e.g. the 3 Fungi types) come from the posterior together or not at all
+    # (panel agent 3). Probability n/(n+SHRINK_N0), n = replays the group appeared in.
+    groups = replay_groups()
+    use, units = {}, {}
+    for u in unit_ids:
+        n = counts.get(u, 0)
+        key = groups.get(u)
+        if key not in use:
+            use[key] = random.random() < n / (n + SHRINK_N0)
+        if f"{u}.dmg" in row and n and use[key]:
+            units[u] = {k: float(row[f"{u}.{k}"]) for k in UNIT_KEYS}
+        else:
+            units[u] = prior_unit(u)
+    return glob, units
+
+
+_GROUPS = None
+
+
+def replay_groups():
+    """unit_id -> frozenset of (round, match) replays it appeared in (cached)."""
+    global _GROUPS
+    if _GROUPS is None:
+        import glob as _g
+        obs = []
+        for f in sorted(_g.glob(str(REPLAYS / "*_outcomes.csv"))):
+            obs += list(csv.DictReader(open(f)))
+        keys = {(o["round"], o["match"]) for o in obs}
+        g = {}
+        for p in csv.DictReader(open(RAW / "placements.csv")):
+            if (p["round"], p["match"]) in keys:
+                g.setdefault(p["unit_id"], set()).add((p["round"], p["match"]))
+        _GROUPS = {u: frozenset(v) for u, v in g.items()}
+    return _GROUPS
+
+
+# ---------------------------------------------------------------- data
+def load():
+    units = {r["unit_id"]: r for r in csv.DictReader(open(RAW / "units.csv"))}
+    places = list(csv.DictReader(open(RAW / "placements.csv")))
+    matches = list(csv.DictReader(open(RESULTS / "matches.csv")))
+    return units, places, matches
+
+
+def match_units(places, rnd, match):
+    return [p for p in places if p["round"] == rnd and p["match"] == match]
+
+
+# ---------------------------------------------------------------- mechanics
+def counter_mult(a, t, k):
+    m = 1.0
+    for x in (a["range_type"], a["target_type"]):
+        for y in (t["range_type"], t["target_type"]):
+            if (x, y) in BEATS: m *= k
+            if (y, x) in BEATS: m /= k
+    return m
+
+
+def can_target(a, t):
+    return not ("Cannot Target Flying" in a["u"]["special_tags"] and t["u"]["range_type"] == "Flying")
+
+
+def react(hit_el, tgt, t, G):
+    """Apply an element to a target. Returns (damage multiplier, swirl?)."""
+    aura = tgt["aura"] if tgt["aura_until"] > t else None
+    if aura is None and tgt["u"].get("self_aura") == "yes":   # slimes carry their own element permanently
+        aura = tgt["els"][0]
+    if hit_el in ("Physical", None) or aura is None or aura == hit_el:
+        if hit_el not in ("Physical", None, "Anemo"):
+            tgt["aura"], tgt["aura_until"] = hit_el, t + AURA_S
+        return 1.0, False
+    pair = {hit_el, aura}
+    tgt["swirled"] = aura   # remembered so Swirl can spread it (panel agent 2)
+    tgt["rx"] = tgt.get("rx", 0) + 1
+    tgt["aura"], tgt["aura_until"] = None, 0
+    if pair == {"Hydro", "Cryo"}:
+        if "Boss" in tgt["u"].get("special_tags", "") and not G.get("boss_freeze", 1):
+            return 1.0, False
+        tgt["stun"] = max(tgt["stun"], t + G["freeze_s"]); tgt["frozen_until"] = t + G["freeze_s"]
+        return 1.0, False
+    if pair in ({"Pyro", "Hydro"}, {"Pyro", "Cryo"}):
+        return G["amp"], False
+    if pair in ({"Electro", "Hydro"}, {"Pyro", "Electro"}, {"Cryo", "Electro"}):
+        flat = FLAT_RX                      # Electro-Charged / Overloaded / Superconduct: flat damage
+        if tgt["ward"] > 0:
+            a = min(tgt["ward"], flat); tgt["ward"] -= a; flat -= a
+        tgt["hp"] -= flat
+        return 1.0, False
+    if hit_el == "Anemo":
+        return 1.0, True
+    return 1.0, False
+
+
+def build(units, plist, G, U):
+    ents = []
+    luck = {p["unit_id"]: random.lognormvariate(0, BATTLE_NOISE) for p in plist}
+    for p in plist:
+        u = units[p["unit_id"]]
+        n = int(u["members_per_squad"])
+        hp = float(u["max_hp"]) if (G["per_member"] or n == 1) else float(u["max_hp"]) / n
+        up = U[u["unit_id"]]
+        summon = 1 + (random.uniform(0.3, 1.0) if u.get("summon") == "yes" else 0)   # summoned pet adds damage, untargetable
+        els = u["element"].split("|") if u["element"] else ["Physical"]
+        for _ in range(n):
+            jr, jc = ((random.uniform(-0.4, 0.4), random.uniform(-0.4, 0.4)) if n > 1 else (0, 0))
+            ward = random.uniform(0.1, 0.4) * hp if u.get("geo_ward") == "yes" else 0.0
+            ents.append(dict(u=dict(u), side=p["side"], r=float(p["row"]) + jr, c=float(p["col"]) + jc,
+                             hp=hp, max=hp, atk=float(u["atk"]) * up["dmg"] * G["g"] * luck[u["unit_id"]] * summon, iv=up["iv"],
+                             next=(0.0 if (u.get("opening_burst") or u.get("opening_aoe")) else random.uniform(0, up["iv"])), stun=0.0, els=els, el_i=0,
+                             aura=None, aura_until=0.0, frozen_until=0.0, burns=[], dead=False,
+                             burst=int(u.get("opening_burst") or 0), buff_next=random.uniform(3, 8), buff_iv=random.uniform(3, 8), stacks=0,
+                             ward=ward, rx=0, shell_at=random.randint(3, 10), opening_aoe=u.get("opening_aoe") == "yes", plunge=False,
+                             plunge_x=(G.get("plunge_x", 3.0) if u.get("kill_plunge") == "yes" else 0.0)))
+    return ents
+
+
+def run(units, plist, G, U, dt=0.1, trace=None):
+    """Simulate one battle. Returns (winner_side, winner_hp_frac, loser_wipe_time or None).
+    If `trace` is a list, one row per simulated second is appended:
+    (t, L team HP fraction, R team HP fraction, L bodies alive, R bodies alive)."""
+    ents = build(units, plist, G, U)
+    tot = {s: sum(e["max"] for e in ents if e["side"] == s) for s in "LR"}
+    t = 0.0
+    next_tr = 0.0
+    next_pulse = 0.0
+    fields = []
+    for e in ents:
+        if e["u"].get("frost_field") == "yes":
+            e["next_mist"] = G.get("mist_t0", 10.0)
+    while t < CLOCK + OVERTIME:
+        for e in ents:   # Sappho frost field: cast on the densest enemy cluster
+            if e.get("next_mist") is not None and e["hp"] > 0 and t >= e["next_mist"] and t >= e["stun"]:
+                foes = [o for o in ents if o["side"] != e["side"] and o["hp"] > 0]
+                e["next_mist"] = t + G.get("mist_iv", 20.0)
+                if foes:
+                    R = G.get("mist_r", 2.0)
+                    c = max(foes, key=lambda o: sum(math.hypot(p["r"] - o["r"], p["c"] - o["c"]) <= R for p in foes))
+                    base = float(e["u"]["atk"])
+                    for o in foes:
+                        if math.hypot(o["r"] - c["r"], o["c"] - c["c"]) <= R:
+                            react("Hydro", o, t, G); o["hp"] -= 0.281 * base
+                    fields.append(dict(r=c["r"], c=c["c"], R=R, side=e["side"], until=t + G.get("mist_dur", 3.5),
+                                       nxt=t + G.get("mist_tick", 0.5), tick=G.get("mist_tick", 0.5), atk=base))
+        for f in fields:
+            if t >= f["nxt"] and t <= f["until"]:
+                f["nxt"] = t + f["tick"]
+                for o in ents:
+                    if o["side"] != f["side"] and o["hp"] > 0 and math.hypot(o["r"] - f["r"], o["c"] - f["c"]) <= f["R"]:
+                        mult, _ = react("Cryo", o, t, G)
+                        dmg = 0.0563 * f["atk"] * mult
+                        if o["frozen_until"] > t: dmg *= 1 + G["shatter"]
+                        o["hp"] -= dmg
+        fields = [f for f in fields if f["until"] >= t]
+        if trace is not None and t >= next_tr - 1e-9:
+            trace.append((round(t, 1),
+                          sum(max(e["hp"], 0) for e in ents if e["side"] == "L") / tot["L"],
+                          sum(max(e["hp"], 0) for e in ents if e["side"] == "R") / tot["R"],
+                          sum(e["hp"] > 0 for e in ents if e["side"] == "L"),
+                          sum(e["hp"] > 0 for e in ents if e["side"] == "R")))
+            next_tr += 1.0
+        for e in ents:   # healers; Hydro rain optionally wets own team
+            if e["hp"] > 0 and e["u"]["heal_allies"]:
+                for f in ents:
+                    if f["side"] == e["side"] and f["hp"] > 0:
+                        f["hp"] = min(f["max"], f["hp"] + f["max"] * 0.01 * dt)
+                        if G["rain_on"] and e["u"]["self_hydro_rain"]:
+                            f["aura"], f["aura_until"] = "Hydro", t + AURA_S
+        for b in ents:   # support units: each skill gives other allies +10% ATK (cap 5 stacks) and heals 5% max HP
+            if b["hp"] > 0 and b["u"].get("buffer") == "yes" and t >= b["buff_next"] and t >= b["stun"]:
+                for f in ents:
+                    if f is not b and f["side"] == b["side"] and f["hp"] > 0:
+                        if f["stacks"] < 5: f["stacks"] += 1; f["atk"] *= 1.10
+                        f["hp"] = min(f["max"], f["hp"] + 0.05 * f["max"])
+                b["buff_next"] = t + b["buff_iv"]
+        for a in ents:
+            if a["hp"] <= 0 or t < a["next"] or t < a["stun"]: continue
+            foes = [e for e in ents if e["side"] != a["side"] and e["hp"] > 0 and can_target(a, e)]
+            if not foes:
+                a["next"] = t + a["iv"]; continue
+            tm = int(G.get("target_mode", 0))
+            if tm == 1:      # focus the weakest foe
+                tgt = min(foes, key=lambda e: e["hp"])
+            elif tm == 2:    # pick a random foe and stay on it until it dies
+                if a.get("tgt") is None or a["tgt"]["hp"] <= 0 or a["tgt"] not in foes:
+                    a["tgt"] = random.choice(foes)
+                tgt = a["tgt"]
+            else:
+                tgt = min(foes, key=lambda e: math.hypot(e["r"] - a["r"], e["c"] - a["c"]))
+            d = math.hypot(tgt["r"] - a["r"], tgt["c"] - a["c"])
+            if a["u"]["range_type"] == "Melee" and d > 1.2:
+                step = 0.5
+                a["c"] += step * (tgt["c"] - a["c"]) / d; a["r"] += step * (tgt["r"] - a["r"]) / d
+                a["next"] = t + 0.5; continue
+            if a["u"]["kites"]:   # step away from any adjacent melee enemy, then shoot
+                for m in foes:
+                    dm = math.hypot(m["r"] - a["r"], m["c"] - a["c"])
+                    if m["u"]["range_type"] == "Melee" and dm < 1.2:
+                        a["c"] += 0.6 * (a["c"] - m["c"]) / max(dm, 0.1)
+                        a["r"] += 0.6 * (a["r"] - m["r"]) / max(dm, 0.1)
+            el = a["els"][a["el_i"] % len(a["els"])]; a["el_i"] += 1
+            near = [e for e in foes if math.hypot(e["r"] - tgt["r"], e["c"] - tgt["c"]) <= G["aoe_r"]]
+            splash = a["u"]["target_type"] == "AoE" or "Splash AoE" in a["u"].get("special_tags", "")
+            hits = [(e, 1.0) for e in near] if splash else [(tgt, 1.0)]
+            if "Splash AoE" in a["u"].get("special_tags", ""):   # panel agent 2: replay shows her volleys
+                hits = [(e, 1.0) for e in sorted(foes, key=lambda e: math.hypot(e["r"] - tgt["r"], e["c"] - tgt["c"]))[:3]]
+            if a["plunge"]:   # Ninken: after a kill, next attack is one AoE plunge at plunge_x times a normal hit
+                a["plunge"] = False
+                hits = [(e, a["plunge_x"]) for e in near]
+            if a["opening_aoe"]:   # entry move: one AoE hit at ~2x damage (assumption)
+                a["opening_aoe"] = False
+                hits = [(e, 2.0) for e in near]
+            if a["u"]["secondary_aoe"] == "yes" and not splash:
+                hits += [(e, 0.5) for e in near if e is not tgt]
+            for h, frac in hits:
+                if el in h["u"].get("immune", "").split("|"):   # e.g. Pyro Specter vs Pyro DMG
+                    continue
+                if h["frozen_until"] > t and el in ("Anemo", "Pyro"):   # Swirl / Melt consumes Freeze (panel agent 2)
+                    h["frozen_until"] = t; h["stun"] = min(h["stun"], t)
+                mult, swirl = react(el, h, t, G)
+                dmg = a["atk"] * frac * mult * counter_mult(a["u"], h["u"], G["k"])
+                if h["frozen_until"] > t: dmg *= 1 + G["shatter"]
+                if h["ward"] > 0:   # Geo Ward absorbs damage first
+                    absorbed = min(h["ward"], dmg); h["ward"] -= absorbed; dmg -= absorbed
+                was_alive = h["hp"] > 0
+                h["hp"] -= dmg
+                if was_alive and h["hp"] <= 0 and a["plunge_x"] > 0:
+                    a["plunge"] = True
+                if h["u"].get("shell") and h["rx"] >= h["shell_at"]:   # Fontemer shell breaks after enough reactions
+                    sh = h["u"]["shell"]; h["u"]["shell"] = ""
+                    if h["u"]["unit_id"] == "sternshield_crab":
+                        h["u"]["range_type"], h["els"] = "Melee", ["Physical"]
+                    elif h["u"]["unit_id"] == "bubbler_seahorse":
+                        h["u"]["target_type"], h["els"] = "Single-Target", ["Hydro"]
+                if a["u"]["cc_on_hit"] == "immobilize" and "Boss" not in h["u"].get("special_tags", ""):
+                    h["stun"] = max(h["stun"], t + 0.5)   # card: immobilizes "weaker enemies" (panel agent 2)
+                if a["u"].get("ground_burn") == "yes" and h["u"]["range_type"] != "Flying":
+                    h["burns"].append((0.1 * a["atk"], t + 3.0, el))   # burning zone: 0.1x ATK/s for 3 s
+                if swirl:
+                    for o in foes:
+                        if o is not h and math.hypot(o["r"] - h["r"], o["c"] - h["c"]) <= 1.5:
+                            o["hp"] -= 0.5 * a["atk"]
+                            sw = h.get("swirled")   # Swirl spreads the absorbed element (panel agent 2)
+                            if sw and sw not in o["u"].get("immune", "").split("|"):
+                                react(sw, o, t, G)
+            slow = 1 + G["cryo_slow"] if (a["aura"] == "Cryo" and a["aura_until"] > t) else 1
+            a["next"] = t + a["iv"] * slow
+            if a["burst"] > 0:   # opening suppressive fire: rapid first volleys
+                a["burst"] -= 1; a["next"] = t + 0.3
+        for e in ents:   # damage-over-time zones
+            if e["hp"] > 0 and e["burns"]:
+                e["burns"] = [b for b in e["burns"] if b[1] > t]
+                for dps, _, bel in e["burns"]:
+                    if bel not in e["u"].get("immune", "").split("|"):
+                        e["hp"] -= dps * dt
+        for e in ents:   # on-death explosions (e.g. Hydro Mimic Finch)
+            if e["hp"] <= 0 and not e["dead"]:
+                e["dead"] = True
+                if e["u"].get("death_aoe"):
+                    for o in ents:
+                        if o["side"] != e["side"] and o["hp"] > 0 and math.hypot(o["r"] - e["r"], o["c"] - e["c"]) <= 1.5:
+                            if e["u"]["death_aoe"] not in o["u"].get("immune", "").split("|"):
+                                react(e["u"]["death_aoe"], o, t, G)
+                                o["hp"] -= e["atk"]
+        if t >= CLOCK + OT_DELAY and t >= next_pulse:
+            for e in ents:
+                if e["hp"] > 0:
+                    e["hp"] -= G.get("ot_pct", 0.11) * e["max"]
+            next_pulse = t + G.get("ot_period", 5.0)
+        L = sum(e["hp"] > 0 for e in ents if e["side"] == "L")
+        R = sum(e["hp"] > 0 for e in ents if e["side"] == "R")
+        if not L or not R:
+            w = "L" if L else ("R" if R else random.choice("LR"))
+            return w, sum(max(e["hp"], 0) for e in ents if e["side"] == w) / tot[w], t
+        t += dt
+    fr = {s: sum(max(e["hp"], 0) for e in ents if e["side"] == s) / tot[s] for s in "LR"}
+    w = "L" if fr["L"] > fr["R"] else "R"
+    return w, fr[w], None
+
+
+def tempered(p, seen_frac):
+    """Shrink a win probability toward 50% when the lineup is mostly unseen units.
+    Heuristic after the R16-B miss: weight = 0.4 + 0.6 * (share of unit types seen in a replay)."""
+    w = 0.4 + 0.6 * seen_frac
+    return 0.5 + (p - 0.5) * w
+
+
+def ev(p_win, mult):
+    return p_win * mult + (1 - p_win) * WRONG_PICK_POINTS
+
+
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    rnd = args[0]
+    n = int(args[1]) if len(args) > 1 else 2000
+    units, places, matches = load()
+    post = [] if "--prior" in sys.argv else load_posterior()
+    counts = replay_counts()
+    print(f"parameters from: {'calibrated posterior (' + str(len(post)) + ' draws)' if post else 'prior'}")
+    random.seed(0)
+    for m in (m for m in matches if m["round"] == rnd):
+        plist = match_units(places, rnd, m["match"])
+        ids = {p["unit_id"] for p in plist}
+        res = []
+        for _ in range(n):
+            G, U = draw_params(ids, post, counts)
+            res.append(run(units, plist, G, U)[0])
+        p = sum(w == "L" for w in res) / n
+        se = math.sqrt(p * (1 - p) / n)
+        lm, rm = float(m["left_mult"]), float(m["right_mult"])
+        print(f"\n{rnd} Match {m['match']}: {m['left_team']} vs {m['right_team']}")
+        print(f"  P(left wins) = {p:.3f} ± {1.96*se:.3f}   crowd says {m['left_support_pct']}%")
+        print(f"  EV/emblem: left {ev(p, lm):.1f} (x{lm:g})   right {ev(1-p, rm):.1f} (x{rm:g})")

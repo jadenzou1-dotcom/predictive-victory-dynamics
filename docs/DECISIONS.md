@@ -1,6 +1,6 @@
 # Decisions and reasoning
 
-Every non-obvious choice made during the event, why it was made, and what was learned. The dated detail is in [FULL_PROJECT_JOURNEY_JOURNAL.md](FULL_PROJECT_JOURNEY_JOURNAL.md).
+Every non-obvious choice made during the event, why it was made, and what was learned. The dated detail is in [JOURNAL.md](JOURNAL.md).
 
 **The two accounts:**
 - **Strategy A** (main account, called "Shadow" in the logs) is risk-adjusted.
@@ -14,16 +14,27 @@ Strategy A started as **max-Sharpe**, the standard risk-adjusted yardstick in qu
 
 In R16-B (the second round) it produced an allocation that felt wrong. It put **28** emblems on Elemental Dye (model 78.5% to win, ×105) and **72** on Blazing Beasts (60.5%, ×30), even though Elemental Dye was better on *both* win probability *and* payout. Sharpe scored the split higher, but it was plainly a worse decision.
 
-To find out why, I reduced it to two coins:
+To find out why, I reduced it to two coins. Sharpe here is excess EV over the 10-point floor per unit of SD:
 
-| Coin | Lose | Win | EV | Sharpe |
-|---|---|---|---|---|
-| 2 | 40% → 10 | 60% → 50 | 34.0 | 1.22 |
-| 2′ (win payout cut to 20) | 40% → 10 | 60% → 20 | 16.0 | **2.04** |
+| Coin | Lose | Win | EV | SD | Sharpe |
+|---|---|---|---|---|---|
+| 2 | 40% → 10 | 60% → 50 | 34.0 | 19.6 | 1.22 |
+| 2′ (win payout cut to 20) | 40% → 10 | 60% → 20 | 16.0 | 4.9 | **1.22** |
 
-Making the bet strictly worse (same odds, smaller payout, half the EV) *raised* its Sharpe. With a fixed 10-point floor, Sharpe on a binary bet reduces to `sqrt(p/(1−p))`: the payout cancels out entirely, so Sharpe only rewards how *reliably* a bet wins, never how *much*.
+Cutting the payout makes the bet strictly worse (same odds, less than half the EV), and Sharpe can't tell the two apart. With a fixed floor, a binary bet's Sharpe reduces to `sqrt(p/(1−p))`: the payout cancels out entirely, so Sharpe only rewards how *reliably* a bet wins, never how *much*.
 
-Sharpe isn't wrong in general. It's the right yardstick when you can lever a portfolio up or down to your risk target. Here stakes are capped at 100 emblems, there's no leverage, payoffs are lumpy and skewed, and the downside is bounded by the floor. Under those conditions max-Sharpe just picks the smallest swings and leaves EV on the table. Full write-up: [FULL_PROJECT_JOURNEY_JOURNAL.md, 2026-10-13 "where the Sharpe ratio falls short"](FULL_PROJECT_JOURNEY_JOURNAL.md).
+That explains the R16-B split. The max-Sharpe (tangency) portfolio of independent bets weights each one by excess EV / variance, which is its Sharpe divided by its SD, so a big-payout bet is penalized for its size:
+
+| R16-B | p | M | Sharpe | Excess EV / Var | Weight |
+|---|---|---|---|---|---|
+| Elemental Dye | 0.785 | ×105 | 1.91 | 74.6 / 1,523 = 0.049 | **28%** |
+| Blazing Beasts | 0.605 | ×30 | 1.24 | 12.1 / 95.6 = 0.127 | **72%** |
+
+Dye had the higher Sharpe *and* the higher EV per emblem (84.6 vs 22.1), and still got the smaller share. `tests/test_strategies.py` checks both results.
+
+(Correction, 2026-11-04: the first version of this table said cutting the payout *raised* Sharpe to 2.04. That was an arithmetic slip; by the formula above it stays at 1.22. The conclusion is unchanged.)
+
+Sharpe isn't wrong in general. It's the right yardstick when you can lever a portfolio up or down to your risk target. Here stakes are capped per match, there's no leverage, payoffs are lumpy and skewed, and the downside is bounded by the floor. Under those conditions max-Sharpe just picks the smallest swings and leaves EV on the table. Full write-up: [JOURNAL.md, 2026-10-13 "where the Sharpe ratio falls short"](JOURNAL.md).
 
 (Honest footnote: in R16-B the Sharpe split happened to score better, 2,440 vs 1,000 for all-in on Dye, because Dye lost. One outcome doesn't make it the right rule.)
 
@@ -93,7 +104,7 @@ The crowd has also backed against Saurians three times, and Saurians won all thr
 
 ### 9. Using the margin of victory as evidence
 
-After QF-B, Jaden noted the wins looked one-sided while the model said ~60/40. `margin_check.py` placed each real result inside the model's own simulated outcome distribution: the 59th and 65th percentiles, i.e. ordinary. The model's outcomes are bimodal (whoever wins usually wins clearly), so "60/40" doesn't mean "close fight". No reason to cut trust.
+After QF-B, Jaden noted the wins looked one-sided while the model said ~60/40. `pvd/backtest/margin_check.py` placed each real result inside the model's own simulated outcome distribution: the 59th and 65th percentiles, i.e. ordinary. The model's outcomes are bimodal (whoever wins usually wins clearly), so "60/40" doesn't mean "close fight". No reason to cut trust.
 
 ### 10. Working rules
 

@@ -1,0 +1,12 @@
+# The model, calibration, blending, allocation and backtests use only the Python standard library.
+
+# charts (scripts/make_charts.py) and the walkthrough notebook
+matplotlib>=3.8
+
+# tests
+pytest>=8
+
+# replay video readers (pvd/replay/), only needed to re-extract data/processed/replays from video
+opencv-python>=4.9
+numpy>=1.26
+rapidocr_onnxruntime>=1.3

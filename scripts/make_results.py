@@ -1,0 +1,240 @@
+"""Build RESULTS.md and the generated track-record tables in README.md and docs/METHODOLOGY.md.
+
+The CSVs in data/ stay the source of truth. Re-run after editing them:
+    python scripts/make_results.py
+"""
+import sys
+from collections import OrderedDict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pvd import RAW, ROOT                                                    # noqa: E402
+from pvd.evaluate import PREDICTORS, SCORES, decided, load, matches, num, scored  # noqa: E402
+
+OUT = ROOT / "RESULTS.md"
+
+
+def pct(x):
+    return "—" if x is None else f"{x * 100:.1f}".rstrip("0").rstrip(".") + "%"
+
+
+def mult(x):
+    return "—" if not x else f"×{x}"
+
+
+crowd = load(RAW / "crowd_log.csv")
+board = load(RAW / "leaderboard.csv")
+
+# ---- track record (model vs backtests vs crowd) -----------------------------
+SHORT = {
+    "The Mysterious Howl Crew": "Howl Crew", "Little Fungi Clan": "Fungi Clan",
+    "Frostarm and Shaman Formation": "Frostarm & Shaman", "Saurians Are the Cutest": "Saurians",
+    "Elemental Dye Experts": "Dye Experts", "Mirror Fruity Order": "Mirror Fruity",
+    "Unofficial Blazing Beasts Members": "Blazing Beasts", "Rude-a-Lot, Hats-a-Not": "Rude-a-Lot",
+    "Reserve Grenadier Squad": "Grenadier", "Seahorse and Crab": "Seahorse & Crab",
+    "A Little Chubby Crisis": "Chubby Crisis", "Consecrated Beast Frightfest": "Consecrated Beast",
+    "What Does the Ninken Say?": "Ninken", "Simple-Soul Hilichurl Fighters": "Hilichurl Fighters",
+    "Ultra-Ancient Heavy Assault Formation": "Ultra-Ancient", "Round-and-Frost Assault": "Round-and-Frost",
+}
+short = lambda t: SHORT.get(t, t)
+ROUND_LABEL = {("Final", "1"): "3rd&nbsp;place", ("Final", "2"): "Final"}
+
+def call(p, w):
+    if p is None:
+        return "—"
+    side = "L" if p > 0.5 else "R"
+    c = max(p, 1 - p) * 100
+    pct = f"{c:.1f}" if c < 55 else f"{c:.0f}"  # keep near-coin-flips distinguishable from 50%
+    return f"{side}&nbsp;{pct}%&nbsp;{'✅' if side == w else '❌'}"
+
+
+S = SCORES
+n = len(scored)
+crowd_all = sum((num(m["left_support_pct"]) > 50) == (m["winner"] == "L") for m in decided)
+DESC = {
+    "live": ("The call actually made before the match, by the model version of the day (v1–v8)",
+             "**None**: true out-of-sample"),
+    "swf": ("v8's battle engine, but each measured value or replay-discovered mechanic is held back until "
+            "the round after its source replay; refit on earlier rounds only (`pvd/backtest/walk_forward_strict.py`)",
+            "Minimal: only the engine's general design (grid, targeting, reactions) came later"),
+    "wf": ("Final model (v8) with its full priors, refit on earlier rounds only",
+           "Structural: its priors and mechanics (overtime pulse, frost field, hit sizes, squad HP) "
+           "were measured in later replays"),
+    "loo": ("Final model (v8), refit on every other match, earlier and later",
+            "Structural + parameter: later rounds are also in the fit"),
+    "crowd": ("Support rate read as a win probability", "None"),
+}
+
+track = [
+    f"**Scoreboard: the {n} matches with a live model call**",
+    "",
+    "| Predictor | How the prediction was made | Look-ahead bias | Correct | Brier ↓ |",
+    "|---|---|---|---|---|",
+]
+for k, label, _, _ in PREDICTORS:
+    r, b = S[k]
+    cnt = f"**{r} / {n}**" if k == "live" else f"{r} / {n}"
+    track.append(f"| {label} | {DESC[k][0]} | {DESC[k][1]} | {cnt} | {b:.3f} |")
+track += [
+    "",
+    "- **Live is the headline.** It is the only row with no look-ahead bias at all.",
+    f"- **Strict walk-forward ({S['swf'][0]}/{n}) is the fair backtest.** It replays the final engine with only "
+    f"what was knowable before each match. It lands near live ({S['live'][0]}/{n}): it misses all three of live's misses "
+    "(R16-A M2, R16-B M1, SF M1) plus R16-B M2 (a 52% call) and QF-B M1. Its Brier score is a little better than live's, so its probabilities "
+    "are better calibrated, but it picks fewer winners.",
+    f"- **Walk-forward with v8 priors ({S['wf'][0]}/{n}) is flattered by look-ahead.** Its only difference from strict "
+    "is priors and mechanics measured in later replays, so the jump from "
+    f"{S['swf'][0]} to {S['wf'][0]} is mostly leakage. Two of its wins "
+    "(R16-B) are 50–51% coin flips anyway.",
+    "- **Noise:** one row beating another by 1–2 matches is within noise. On the Final, where strict and v8 "
+    "have the same information, two separate fits give 0.92 / 0.74 and 0.92 / 0.88.",
+    "- **Brier score** is the mean squared error of the probability (0 is perfect, 0.25 is always saying 50%). It rewards calibrated confidence, not just the right side.",
+    f"- **Why 14, not 16:** the sim needs every unit's stats and grid position. For R16-D the losing teams' "
+    f"unit cards and the board were never captured, so no model (live or backtest) can run those two matches. "
+    f"The crowd went {crowd_all} / {len(decided)} counting them.",
+    "",
+    "**Every match**",
+    "",
+    "Each model or crowd cell shows the side it favoured (L/R) and how confident it was. The winner is in bold.",
+    "",
+    "| Round | Left vs Right | Live model | Strict walk-forward | Walk-forward (v8 priors) | Leave-one-out | Crowd | Winner |",
+    "|---|---|---|---|---|---|---|---|",
+]
+for m in decided:
+    w = m["winner"]
+    L, R = short(m["left_team"]), short(m["right_team"])
+    L, R = (f"**{L}**", R) if w == "L" else (L, f"**{R}**")
+    rnd = ROUND_LABEL.get((m["round"], m["match"]), f"{m['round'].replace('-', '&#8209;')}&nbsp;M{m['match']}")
+    cells = [call(get(m), w) for _, _, get, _ in PREDICTORS]
+    track.append(f"| {rnd} | {L} vs {R} | " + " | ".join(cells) + f" | {w} |")
+totals = [f"**{S[k][0]}&nbsp;/&nbsp;{n}**" for k, _, _, _ in PREDICTORS]
+track.append(f"| **Correct** | *out of the {n} matches with a model call* | " + " | ".join(totals) + f" | {n}&nbsp;/&nbsp;{n} |")
+track.append("")
+
+# compact scoreboard for the README: one row per predictor, least to most look-ahead bias
+scoreboard = [
+    "| Predictor | Look-ahead bias | Correct | Brier ↓ |",
+    "|---|---|---|---|",
+]
+for k, label, _, bias in PREDICTORS:
+    r, b = S[k]
+    cnt = f"**{r} / {n}**" if k == "live" else f"{r} / {n}"
+    brier = f"**{b:.3f}**" if k == "live" else f"{b:.3f}"
+    scoreboard.append(f"| {label} | {bias} | {cnt} | {brier} |")
+scoreboard.append("")
+
+STAMP = ("<!-- generated by scripts/make_results.py from data/results/matches.csv, backtest_v8.csv "
+         "and backtest_strict_wf.csv; do not edit by hand -->")
+
+
+def inject(path, name, body):
+    """Replace the generated block between <!-- name:start --> and <!-- name:end --> in a doc."""
+    start, end = f"<!-- {name}:start -->", f"<!-- {name}:end -->"
+    p = ROOT / path
+    s = p.read_text(encoding="utf-8")
+    if start not in s:
+        return
+    a, b = s.index(start) + len(start), s.index(end)
+    p.write_text(s[:a] + "\n" + STAMP + "\n\n" + "\n".join(body) + "\n" + s[b:], encoding="utf-8")
+
+
+lines = [
+    "# Results",
+    "",
+    "Human-readable view of every match. Generated by `python scripts/make_results.py` from "
+    "[`data/results/matches.csv`](data/results/matches.csv), "
+    "[`data/results/backtest_v8.csv`](data/results/backtest_v8.csv), "
+    "[`data/results/backtest_strict_wf.csv`](data/results/backtest_strict_wf.csv) and "
+    "[`data/raw/crowd_log.csv`](data/raw/crowd_log.csv); edit the CSVs, not this file.",
+    "",
+    "## Track record",
+    "",
+] + track
+
+# ---- final friends leaderboard ---------------------------------------------
+if board:
+    top = max(int(r["score"]) for r in board)
+    lines += [
+        "## Final leaderboard (friends, prediction score)",
+        "",
+        "End-of-event Friend Records board from the game. Charts: [README](README.md). Source: "
+        "[`data/raw/leaderboard.csv`](data/raw/leaderboard.csv). Other players are anonymized.",
+        "",
+        "| Rank | Player | Score | vs. 1st |",
+        "|---|---|---|---|",
+    ]
+    for r in board:
+        name = f"**{r['player']}**" if r["is_ours"] == "yes" else r["player"]
+        gap = "—" if int(r["score"]) == top else f"−{top - int(r['score']):,}"
+        lines.append(f"| {r['rank']} | {name} | {int(r['score']):,} | {gap} |")
+    lines.append("")
+
+# ---- per round --------------------------------------------------------------
+rounds = OrderedDict()
+for m in matches:
+    rounds.setdefault(m["round"], []).append(m)
+
+for rnd, ms in rounds.items():
+    lines += [f"## {rnd}", ""]
+    for m in ms:
+        L, R = m["left_team"], m["right_team"]
+        p = num(m["model_p_left"])
+        s = num(m["left_support_pct"])
+        w = m["winner"]
+        winner = L if w == "L" else R if w == "R" else None
+
+        def tick(side_left):
+            if winner is None or side_left is None:
+                return ""
+            return " ✅" if side_left == (w == "L") else " ❌"
+
+        model_side = None if p is None else p > 0.5
+        crowd_side = None if s is None else s > 50
+        model_call = "—" if p is None else f"{L if model_side else R} ({pct(max(p, 1 - p))}){tick(model_side)}"
+        crowd_call = "—" if s is None else f"{L if crowd_side else R} ({max(s, 100 - s):.0f}%){tick(crowd_side)}"
+
+        lines += [
+            f"### {ROUND_LABEL.get((m['round'], m['match']), 'Match ' + m['match']).replace('&nbsp;', ' ')}: {L} vs {R}",
+            "",
+            "| | Left | Right |",
+            "|---|---|---|",
+            f"| Team | {'**' + L + '**' if w == 'L' else L} | {'**' + R + '**' if w == 'R' else R} |",
+            f"| Crowd support | {m['left_support_pct'] or '—'}% | {m['right_support_pct'] or '—'}% |",
+            f"| Multiplier | {mult(m['left_mult'])} | {mult(m['right_mult'])} |",
+            f"| Model win chance | {pct(p)} | {pct(None if p is None else 1 - p)} |",
+            "",
+            f"- **Winner:** {winner or 'pending'}",
+            f"- **Model's call:** {model_call}",
+            f"- **Crowd's call:** {crowd_call}",
+        ]
+        if m["pick"]:
+            lines.append(f"- **Picks:** {m['pick']}")
+        if m["score_earned"]:
+            lines.append(f"- **Score earned:** {m['score_earned']}")
+        if num(m["brier_model"]) is not None:
+            lines.append(f"- **Brier:** model {num(m['brier_model']):.3f}, crowd {num(m['brier_crowd']):.3f}")
+        if m["notes"]:
+            lines.append(f"- **Notes:** {m['notes']}")
+        lines.append("")
+
+    snaps = [c for c in crowd if c["round"] == rnd]
+    if snaps:
+        lines += [
+            "<details><summary>Crowd snapshots this round</summary>",
+            "",
+            "| Match | Time (ET) | Locked | Left support | Right support | Left mult | Right mult | Notes |",
+            "|---|---|---|---|---|---|---|---|",
+        ]
+        for c in snaps:
+            lines.append(
+                f"| {c['match']} | {c['snapshot_time_et']} | {c['locked']} | {c['left_support_pct']}% | "
+                f"{c['right_support_pct']}% | {mult(c['left_mult'])} | {mult(c['right_mult'])} | {c['notes']} |"
+            )
+        lines += ["", "</details>", ""]
+
+inject("README.md", "scoreboard", scoreboard)
+inject("docs/METHODOLOGY.md", "track-record", track)
+
+with open(OUT, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines).rstrip() + "\n")
+print(f"wrote {OUT.name}: {len(matches)} matches, {len(decided)} decided")

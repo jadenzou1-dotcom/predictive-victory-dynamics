@@ -1,0 +1,9 @@
+[project]
+name = "pvd"
+version = "1.0.0"
+description = "Monte Carlo battle model, Bayesian calibration, look-ahead-free backtests and mean-variance bet sizing for a prediction event"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
