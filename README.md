@@ -2,7 +2,9 @@
 
 **Forecasting and bet sizing under uncertainty: a Monte Carlo battle model, Bayesian calibration to video data, look-ahead-free backtests, and mean-variance position sizing, used live against a crowd-priced market.**
 
-The test case was Genshin Impact's *Predictive Victory Dynamics* event (Oct 12–19, 2026). Players stake emblems on one of two auto-battling armies, and the less popular side pays a higher multiplier: a parimutuel binary bet where the crowd sets the price. I built a simulator from each unit's stat card, calibrated it to frame-by-frame readings of the replays, and sized bets on the sides the crowd under-priced.
+> **11 / 14 matches called correctly out-of-sample, against 6 / 14 for the crowd** · 1st and 2nd on the leaderboard · two long-shot calls in the Final (crowd 14% and 25%, model 91% and 87%) both won, paying ×200 and ×105
+
+The test case was a week-long live prediction event (Oct 12–19, 2026). Players stake emblems on one of two auto-battling armies, and the less popular side pays a higher multiplier: a parimutuel binary bet where the crowd sets the price. I built a simulator from each unit's stat card, calibrated it to frame-by-frame readings of the replays, and sized bets on the sides the crowd under-priced. Background on the event and its rules is in [METHODOLOGY.md §1](docs/METHODOLOGY.md#1-the-problem-a-parimutuel-binary-bet).
 
 ## Results
 
@@ -112,7 +114,8 @@ data/
 ├── raw/                   unit cards, placements, crowd snapshots, replay outcomes, leaderboard
 ├── processed/             per-frame replay extracts, measured hits, posterior samples
 └── results/               live match log (predictions, picks, scores), backtest predictions
-docs/                      methodology, decisions, project journal
+docs/                      methodology, decisions, journal, skills, round notes
+archive/                   early prototypes, superseded by pvd/
 ```
 
 ## Reproduce
@@ -141,3 +144,6 @@ The CSVs in `data/` are the source of truth. `RESULTS.md`, `charts/` and the gen
 | [docs/DECISIONS.md](docs/DECISIONS.md) | Each major decision and why: Sharpe → CE, choosing λ, trust weights, pacing emblems, betting against the crowd |
 | [docs/JOURNAL.md](docs/JOURNAL.md) | The dated, as-it-happened log, corrections included |
 | [RESULTS.md](RESULTS.md) | Every match: crowd support, multipliers, model call, winner, picks, score |
+| [docs/SKILLS.md](docs/SKILLS.md) | The skills the project used, grouped by area: decision theory, market reasoning, simulation, computer vision, data engineering |
+| [docs/rounds/](docs/rounds/) | Round-by-round notes from the first rounds: boards, crowd odds, replay observations, why the model missed |
+| [archive/](archive/) | Early prototypes (first allocation sweep, first ABC calibrator, first HP-bar tracker), kept for history |

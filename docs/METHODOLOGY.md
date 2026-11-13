@@ -12,6 +12,8 @@ The full write-up: the betting problem, how the battle model works and was calib
 
 ## 1. The problem: a parimutuel binary bet
 
+**Background.** The event was *Predictive Victory Dynamics*, a limited-time event in the game Genshin Impact that ran Oct 12–19, 2026. Sixteen auto-battles between armies of in-game units were played over a bracket (Round of 16 → Final), and every player could back the winner of each one by staking Victory Emblems. Unit stat cards and board layouts were public before each round, and full replays were available afterwards. That made it a small, well-defined forecasting market with real crowd prices to beat.
+
 Each match is an auto-battle between two unit teams. Players stake Victory Emblems on a side before the support rate locks. A right pick pays `emblems × multiplier`; a wrong pick still pays `emblems × 10`. The less popular side pays the higher multiplier, so the crowd's support rate works like parimutuel odds: it is an implied probability, and the multiplier is the price.
 
 The edge therefore comes from two places: a better win probability than the crowd's, and the payout asymmetry when a strong side is priced as a long shot.
